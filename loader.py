@@ -26,15 +26,10 @@ def load_indicator_all_data(indicator_id, force=False):
         return
 
     # Строим фильтры: для каждого поля, кроме "Показатель", ставим "*"
-    filters = {}
-    for _, row in data_ids.iterrows():
-        fid = row['filter_field_id']
-        if fid == '0':
-            continue
-        filters[row['filter_field_title']] = '*'
-
-    # Фильтруем data_ids
-    filtered_ids = filter_data_ids(data_ids, filters)
+    # Временно пропускаем фильтрацию, чтобы проверить загрузку
+    filtered_ids = data_ids
+    logger.info(f"Используем data_ids без фильтрации, строк: {len(filtered_ids)}")
+    logger.info(f"Отправляем POST с {len(filtered_ids)} строками")
 
     if filtered_ids.empty:
         logger.warning(f"После фильтрации для индикатора {indicator_id} не осталось данных.")
