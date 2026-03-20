@@ -1,5 +1,4 @@
 import re
-import json
 import logging
 import requests
 import pandas as pd
@@ -37,78 +36,71 @@ def _normalize_js_string(s):
     s = re.sub(r',\s*]', ']', s)
     return s
 
-def _extract_filters_block(script):
-    """Извлекает блок между 'filters: {' и ',left_columns:'."""
-    start = script.find('filters: {')
-    if start == -1:
+def _extract_balanced_brace(text, start_pos):
+    """Извлекает сбалансированный блок в фигурных скобках, начиная с позиции start_pos."""
+    brace_start = text.find('{', start_pos)
+    if brace_start == -1:
         return None
-    end = script.find(',left_columns:', start)
-    if end == -1:
+    balance = 1
+    i = brace_start + 1
+    while balance > 0 and i < len(text):
+        if text[i] == '{':
+            balance += 1
+        elif text[i] == '}':
+            balance -= 1
+        i += 1
+    if balance != 0:
         return None
-    # Вырезаем текст от начала объекта до конца блока
-    block = script[start:end].strip()
-    # Добавляем закрывающую скобку, если её нет
-    if not block.endswith('}'):
-        # Ищем последнюю закрывающую скобку в блоке
-        # Проще взять весь блок и сбалансировать
-        # Но для простоты: находим позицию последней '}' до end
-        brace_pos = block.rfind('}')
-        if brace_pos != -1:
-            block = block[:brace_pos+1]
-        else:
-            block = block + '}'
-    return block
+    return text[brace_start:i]
 
-def _parse_js_filters(script):
-    block = _extract_filters_block(script)
+def _extract_array(text, key):
+    """Извлекает массив вида key: [ ... ]."""
+    pos = text.find(f'{key}:')
+    if pos == -1:
+        return []
+    bracket_start = text.find('[', pos)
+    if bracket_start == -1:
+        return []
+    balance = 1
+    i = bracket_start + 1
+    while balance > 0 and i < len(text):
+        if text[i] == '[':
+            balance += 1
+        elif text[i] == ']':
+            balance -= 1
+        i += 1
+    if balance != 0:
+        return []
+    arr_str = text[bracket_start:i]
+    arr_str = _normalize_js_string(arr_str)
+    try:
+        arr = demjson3.decode(arr_str)
+        return arr if isinstance(arr, list) else []
+    except:
+        return []
+
+def parse_js1(script_text):
+    """Извлекает и парсит объект filters из скрипта."""
+    pos = script_text.find('filters: {')
+    if pos == -1:
+        raise ValueError("Не найдено 'filters: {'")
+    block = _extract_balanced_brace(script_text, pos)
     if not block:
         raise ValueError("Не удалось извлечь блок filters")
-    logger.debug(f"Извлечённый блок (первые 500 символов):\n{block[:500]}")
-    # Сохраняем блок в файл для анализа
-    with open("logs/filters_block.txt", "w", encoding="utf-8") as f:
-        f.write(block)
     block = _normalize_js_string(block)
     try:
         data = demjson3.decode(block)
+        return data  # ожидаем словарь с ключом 'filters'
     except Exception as e:
-        logger.exception("Ошибка парсинга JSON фильтров")
-        raise ValueError(f"Ошибка парсинга JSON фильтров: {e}")
-    return data
+        logger.exception("Ошибка парсинга JSON в parse_js1")
+        raise ValueError(f"Ошибка парсинга фильтров: {e}")
 
-def _parse_js_object_ids(script):
+def parse_js2(script_text):
+    """Извлекает left_columns, top_columns, groups."""
     result = {}
     for key in ['left_columns', 'top_columns', 'groups']:
-        # Находим массив
-        start = script.find(f'{key}:')
-        if start == -1:
-            continue
-        bracket_start = script.find('[', start)
-        if bracket_start == -1:
-            continue
-        balance = 1
-        i = bracket_start + 1
-        while balance > 0 and i < len(script):
-            if script[i] == '[':
-                balance += 1
-            elif script[i] == ']':
-                balance -= 1
-            i += 1
-        if balance != 0:
-            continue
-        arr_str = script[bracket_start:i]
-        arr_str = _normalize_js_string(arr_str)
-        try:
-            arr = demjson3.decode(arr_str)
-        except Exception:
-            continue
-        obj_type = 'lineObjectIds'
-        if key == 'top_columns':
-            obj_type = 'columnObjectIds'
-        elif key == 'groups':
-            obj_type = 'filterObjectIds'
-        for item in arr:
-            if isinstance(item, dict) and 'id' in item:
-                result[str(item['id'])] = obj_type
+        arr = _extract_array(script_text, key)
+        result[key] = arr
     return result
 
 @retry(max_tries=3, delay=2, backoff=2, exceptions=(requests.exceptions.RequestException,))
@@ -126,31 +118,40 @@ def get_data_ids(indicator_id):
     scripts = soup.find_all('script')
     logger.info(f"Найдено скриптов: {len(scripts)}")
     if len(scripts) < 12:
-        logger.warning(f"Найдено только {len(scripts)} скриптов, берём последний")
-        script_tag = scripts[-1] if scripts else None
-    else:
-        script_tag = scripts[11]  # 12-й элемент
-
-    if not script_tag or not script_tag.string:
-        raise ValueError("Не удалось найти скрипт с фильтрами")
+        raise ValueError(f"Найдено только {len(scripts)} скриптов, ожидалось минимум 12")
+    script_tag = scripts[11]
+    if not script_tag.string:
+        raise ValueError("12-й скрипт не содержит текста")
     script_text = script_tag.string
-    logger.debug(f"Скрипт (первые 500 символов): {script_text[:500]}")
-    # Сохраняем скрипт в файл для отладки
-    with open("logs/script.txt", "w", encoding="utf-8") as f:
-        f.write(script_text)
+    logger.debug(f"12-й скрипт длиной {len(script_text)} символов")
 
-    filters_data = _parse_js_filters(script_text)
-    object_ids = _parse_js_object_ids(script_text)
+    # Парсим фильтры
+    filter_dict = parse_js1(script_text)
+    filter_list = filter_dict.get('filters', [])  # список объектов фильтров
+    if not filter_list:
+        raise ValueError("Не найдено фильтров в data_ids")
 
-    # Выводим структуру filters_data
-    logger.debug(f"Ключи filters_data: {list(filters_data.keys())}")
-    if 'filters' in filters_data:
-        logger.debug(f"Количество групп фильтров: {len(filters_data['filters'])}")
-    else:
-        logger.warning("В filters_data нет ключа 'filters'")
+    # Парсим объекты (left_columns, top_columns, groups)
+    object_dict = parse_js2(script_text)
 
+    # Формируем mapping filter_field_id -> object_type
+    object_ids = {}
+    for key in ['left_columns', 'top_columns', 'groups']:
+        obj_type = 'lineObjectIds'
+        if key == 'top_columns':
+            obj_type = 'columnObjectIds'
+        elif key == 'groups':
+            obj_type = 'filterObjectIds'
+        for item in object_dict.get(key, []):
+            if isinstance(item, dict) and 'id' in item:
+                object_ids[str(item['id'])] = obj_type
+
+    # Добавляем специальный filterObjectIds для индикатора (id=0)
+    object_ids['0'] = 'filterObjectIds'
+
+    # Собираем строки data_ids
     rows = []
-    for filter_group in filters_data.get('filters', []):
+    for filter_group in filter_list:
         field_id = str(filter_group.get('id', ''))
         field_title = filter_group.get('title', '')
         values = filter_group.get('values', {})
@@ -159,18 +160,19 @@ def get_data_ids(indicator_id):
             rows.append([field_id, field_title, str(val_id), val_title, ''])
 
     if not rows:
-        logger.error("Не найдено ни одного фильтра в data_ids")
         raise ValueError("Не найдено ни одного фильтра в data_ids")
 
     df = pd.DataFrame(rows, columns=['filter_field_id', 'filter_field_title',
                                      'filter_value_id', 'filter_value_title',
                                      'filter_field_object_ids'])
+
+    # Заполняем filter_field_object_ids
     for fid in df['filter_field_id'].unique():
         if fid in object_ids:
             df.loc[df['filter_field_id'] == fid, 'filter_field_object_ids'] = object_ids[fid]
         else:
             df.loc[df['filter_field_id'] == fid, 'filter_field_object_ids'] = 'lineObjectIds'
-    df.loc[df['filter_field_id'] == '0', 'filter_field_object_ids'] = 'filterObjectIds'
+
     logger.info(f"Получено {len(df)} строк data_ids")
     return df
 
@@ -193,9 +195,15 @@ def post_data_ids_filtered(data_ids, data_format='sdmx'):
     for _, row in data_ids.iterrows():
         selected.append(f"{row['filter_field_id']}_{row['filter_value_id']}")
     body['selectedFilterIds'] = selected
+
     url = f"{BASE_URL}/indicator/data.do?format={data_format}"
     response = session.post(url, data=body, timeout=180)
     response.raise_for_status()
+
+    # Сохраняем ответ для отладки
+    with open(f"logs/response.{data_format}", "wb") as f:
+        f.write(response.content)
+
     return response.content
 
 def _parse_sdmx_to_dataframe(xml_bytes):
