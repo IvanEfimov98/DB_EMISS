@@ -1,0 +1,34 @@
+# Виртуальное окружение
+venv/
+.env/
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Данные
+data/emiss_db/
+data/raw/*.csv
+*.lmdb
+*.parquet
+
+# Конфигурация с секретами
+config/secrets.yaml
+
+# Логи и временное
+logs/
+*.log
+*.tmp
+
+# Сгенерированные документы
+outputs/
+*.docx
+*.pdf
+
+# Прочее
+.DS_Store
