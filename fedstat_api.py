@@ -30,14 +30,7 @@ session.get(BASE_URL, timeout=30)
 
 os.makedirs("logs", exist_ok=True)
 
-def _normalize_js_string(s):
-    s = re.sub(r'//.*', '', s)
-    s = re.sub(r',\s*}', '}', s)
-    s = re.sub(r',\s*]', ']', s)
-    return s
-
 def _extract_balanced_brace(text, start_pos):
-    """Извлекает сбалансированный блок в фигурных скобках, начиная с позиции start_pos."""
     brace_start = text.find('{', start_pos)
     if brace_start == -1:
         return None
@@ -53,55 +46,63 @@ def _extract_balanced_brace(text, start_pos):
         return None
     return text[brace_start:i]
 
-def _extract_array(text, key):
-    """Извлекает массив вида key: [ ... ]."""
-    pos = text.find(f'{key}:')
-    if pos == -1:
-        return []
-    bracket_start = text.find('[', pos)
-    if bracket_start == -1:
-        return []
-    balance = 1
-    i = bracket_start + 1
-    while balance > 0 and i < len(text):
-        if text[i] == '[':
-            balance += 1
-        elif text[i] == ']':
-            balance -= 1
-        i += 1
-    if balance != 0:
-        return []
-    arr_str = text[bracket_start:i]
-    arr_str = _normalize_js_string(arr_str)
-    try:
-        arr = demjson3.decode(arr_str)
-        return arr if isinstance(arr, list) else []
-    except:
-        return []
+def _clean_js_object(js_block):
+    """Очистка JavaScript-объекта для парсинга как JSON."""
+    # Удаляем однострочные комментарии
+    lines = js_block.split('\n')
+    cleaned_lines = []
+    for line in lines:
+        # Удаляем //, но не внутри строк (упрощённо)
+        if '//' in line:
+            # Простой способ: удаляем всё после //, если не внутри кавычек
+            # Для сложных случаев можно улучшить, но для fedstat хватит
+            line = re.sub(r'(?<!["\'])\\/\\/.*$', '', line)
+        cleaned_lines.append(line)
+    js_block = '\n'.join(cleaned_lines)
+    # Убираем trailing запятые
+    js_block = re.sub(r',\s*}', '}', js_block)
+    js_block = re.sub(r',\s*]', ']', js_block)
+    # Заменяем одинарные кавычки на двойные
+    js_block = js_block.replace("'", '"')
+    # Удаляем вызовы типа $('#grid')
+    js_block = re.sub(r'\$\([^)]+\)', 'null', js_block)
+    # Удаляем символ $
+    js_block = js_block.replace('$', '')
+    return js_block
 
-def parse_js1(script_text):
-    """Извлекает и парсит объект filters из скрипта."""
-    pos = script_text.find('filters: {')
+def extract_filters_from_html(html_path):
+    """Извлекает фильтры и массивы из 12-го скрипта HTML."""
+    with open(html_path, 'r', encoding='utf-8') as f:
+        html = f.read()
+    soup = BeautifulSoup(html, 'html.parser')
+    scripts = soup.find_all('script')
+    if len(scripts) < 12:
+        raise ValueError(f"Найдено только {len(scripts)} скриптов, ожидалось минимум 12")
+    script_text = scripts[11].string
+    if not script_text:
+        raise ValueError("12-й скрипт не содержит текста")
+
+    # Ищем new FGrid({
+    pos = script_text.find('new FGrid({')
     if pos == -1:
-        raise ValueError("Не найдено 'filters: {'")
+        raise ValueError("Не найдено new FGrid({")
     block = _extract_balanced_brace(script_text, pos)
     if not block:
-        raise ValueError("Не удалось извлечь блок filters")
-    block = _normalize_js_string(block)
+        raise ValueError("Не удалось извлечь блок FGrid")
+    cleaned = _clean_js_object(block)
     try:
-        data = demjson3.decode(block)
-        return data  # ожидаем словарь с ключом 'filters'
+        data = demjson3.decode(cleaned)
     except Exception as e:
-        logger.exception("Ошибка парсинга JSON в parse_js1")
-        raise ValueError(f"Ошибка парсинга фильтров: {e}")
+        logger.exception("Ошибка парсинга FGrid")
+        with open('logs/fgrid_failed.json', 'w', encoding='utf-8') as f:
+            f.write(cleaned)
+        raise ValueError(f"Ошибка парсинга JSON FGrid: {e}")
 
-def parse_js2(script_text):
-    """Извлекает left_columns, top_columns, groups."""
-    result = {}
-    for key in ['left_columns', 'top_columns', 'groups']:
-        arr = _extract_array(script_text, key)
-        result[key] = arr
-    return result
+    filters = data.get('filters', {})
+    left_columns = data.get('left_columns', [])
+    top_columns = data.get('top_columns', [])
+    groups = data.get('groups', [])
+    return {'filters': filters, 'left_columns': left_columns, 'top_columns': top_columns, 'groups': groups}
 
 @retry(max_tries=3, delay=2, backoff=2, exceptions=(requests.exceptions.RequestException,))
 def get_data_ids(indicator_id):
@@ -113,48 +114,41 @@ def get_data_ids(indicator_id):
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(response.text)
     logger.info(f"HTML сохранён в {html_path}")
-    soup = BeautifulSoup(response.text, 'html.parser')
 
-    scripts = soup.find_all('script')
-    logger.info(f"Найдено скриптов: {len(scripts)}")
-    if len(scripts) < 12:
-        raise ValueError(f"Найдено только {len(scripts)} скриптов, ожидалось минимум 12")
-    script_tag = scripts[11]
-    if not script_tag.string:
-        raise ValueError("12-й скрипт не содержит текста")
-    script_text = script_tag.string
-    logger.debug(f"12-й скрипт длиной {len(script_text)} символов")
+    try:
+        extracted = extract_filters_from_html(html_path)
+    except Exception as e:
+        logger.exception("Ошибка извлечения фильтров")
+        raise
 
-    # Парсим фильтры
-    filter_dict = parse_js1(script_text)
-    filter_list = filter_dict.get('filters', [])  # список объектов фильтров
-    if not filter_list:
-        raise ValueError("Не найдено фильтров в data_ids")
+    filters = extracted['filters']
+    left_columns = extracted['left_columns']
+    top_columns = extracted['top_columns']
+    groups = extracted['groups']
 
-    # Парсим объекты (left_columns, top_columns, groups)
-    object_dict = parse_js2(script_text)
-
-    # Формируем mapping filter_field_id -> object_type
+    # Построение mapping filter_field_id -> object_type
     object_ids = {}
-    for key in ['left_columns', 'top_columns', 'groups']:
-        obj_type = 'lineObjectIds'
-        if key == 'top_columns':
-            obj_type = 'columnObjectIds'
-        elif key == 'groups':
-            obj_type = 'filterObjectIds'
-        for item in object_dict.get(key, []):
-            if isinstance(item, dict) and 'id' in item:
-                object_ids[str(item['id'])] = obj_type
-
-    # Добавляем специальный filterObjectIds для индикатора (id=0)
+    for item in left_columns:
+        if isinstance(item, dict) and 'id' in item:
+            object_ids[str(item['id'])] = 'lineObjectIds'
+    for item in top_columns:
+        if isinstance(item, dict) and 'id' in item:
+            object_ids[str(item['id'])] = 'columnObjectIds'
+    for item in groups:
+        if isinstance(item, dict) and 'id' in item:
+            object_ids[str(item['id'])] = 'filterObjectIds'
+    # Специальный фильтр для индикатора (id=0)
     object_ids['0'] = 'filterObjectIds'
 
-    # Собираем строки data_ids
+    # Формируем data_ids
     rows = []
-    for filter_group in filter_list:
-        field_id = str(filter_group.get('id', ''))
-        field_title = filter_group.get('title', '')
-        values = filter_group.get('values', {})
+    for fid, finfo in filters.items():
+        field_id = str(fid)
+        field_title = finfo.get('title', '')
+        values = finfo.get('values', {})
+        if not values:
+            logger.warning(f"Фильтр {field_id} ({field_title}) не имеет значений")
+            continue
         for val_id, val_info in values.items():
             val_title = val_info.get('title', '')
             rows.append([field_id, field_title, str(val_id), val_title, ''])

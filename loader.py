@@ -27,7 +27,16 @@ def load_indicator_all_data(indicator_id, force=False):
 
     # Строим фильтры: для каждого поля, кроме "Показатель", ставим "*"
     # Временно пропускаем фильтрацию, чтобы проверить загрузку
-    filtered_ids = data_ids
+    # Строим словарь фильтров: для каждого поля ставим '*'
+    filters = {}
+    for _, row in data_ids.iterrows():
+        fid = row['filter_field_id']
+        if fid == '0':
+            continue
+        filters[row['filter_field_title']] = '*'
+
+    # Применяем фильтрацию
+    filtered_ids = filter_data_ids(data_ids, filters)
     logger.info(f"Используем data_ids без фильтрации, строк: {len(filtered_ids)}")
     logger.info(f"Отправляем POST с {len(filtered_ids)} строками")
 
